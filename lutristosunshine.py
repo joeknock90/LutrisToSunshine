@@ -339,6 +339,11 @@ def handle_display_command(args) -> int:
             f"audio guard={_format_status_value(snapshot['audio_guard_state'])}",
             f"portal handoff={_format_status_value('active' if snapshot['portal_handoff_active'] else 'idle')}",
         ]
+        if snapshot["sunshine_client_hdr"] == "1":
+            runtime_parts.append(f"hdr={_format_status_value('active')}")
+        elif snapshot["sunshine_client_hdr"] == "0":
+            runtime_parts.append(f"hdr={_format_status_value('inactive')}")
+
         print(_format_kv("Status:", ", ".join(status_parts)))
         print(_format_kv("Runtime:", ", ".join(runtime_parts)))
         isolation_level = "success"

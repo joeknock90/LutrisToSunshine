@@ -24,7 +24,7 @@ LutrisToSunshine imports games from supported launchers into Sunshine and can op
 - Import games from multiple launchers into Sunshine from one CLI
 - Avoid duplicate Sunshine entries
 - Optionally fetch game covers from SteamGridDB
-- Run streamed games in a virtual display that dynamically matches resolution/refresh rate of the client with optional host-controller passthrough
+- Run streamed games in a virtual display that dynamically matches resolution, refresh rate, and HDR support of the client with optional host-controller passthrough
 
 ## Supported Launchers
 

@@ -3951,7 +3951,16 @@ launch_headless_direct() {{
         "PULSE_SINK={audio_sink}"
         "PULSE_SERVER=$pulse_server_value"
         "PULSE_CLIENTCONFIG=$pulse_clientconfig_value"
+        "SUNSHINE_CLIENT_HDR=${{SUNSHINE_CLIENT_HDR:-0}}"
     )
+
+    if [ "${{SUNSHINE_CLIENT_HDR:-0}}" = "1" ]; then
+        log_debug "client HDR support detected; enabling HDR environment variables"
+        launch_command+=(
+            "DXVK_HDR=1"
+            "ENABLE_GAMESCOPE_WSI=1"
+        )
+    fi
 {mangohud_env_append_block.rstrip()}
     launch_command+=(/bin/sh -lc "$command_to_run")
     setsid "${{launch_command[@]}}" >>"$launch_log_file" 2>&1 &
@@ -4077,6 +4086,7 @@ tracked_count=$tracked_count
 command=$decoded_command
 mangohud_config=$mangohud_config_value_field
 launch_log=$launch_log_file
+hdr=${{SUNSHINE_CLIENT_HDR:-0}}
 EOF
 }}
 
@@ -4572,6 +4582,7 @@ mode="{refresh_rate_sync_mode}"
 target_width="${{SUNSHINE_CLIENT_WIDTH:-}}"
 target_height="${{SUNSHINE_CLIENT_HEIGHT:-}}"
 target_fps="${{SUNSHINE_CLIENT_FPS:-}}"
+target_hdr="${{SUNSHINE_CLIENT_HDR:-0}}"
 
 if [ "$mode" = "custom" ]; then
     target_width="{custom_width}"
@@ -4586,6 +4597,13 @@ import time
 print(f"{{time.time():.6f}}")
 PY
 )"
+
+if [ "$target_hdr" = "1" ]; then
+    # Placeholder for potential HDR-specific output configuration if supported by the compositor version.
+    # e.g., swaymsg "output HEADLESS-1 hdr on" or similar.
+    :
+fi
+
 SWAYSOCK="{state['sway_socket']}" swaymsg "output HEADLESS-1 mode ${{target_width}}x${{target_height}}@${{target_fps}}Hz" >/dev/null 2>&1 || true
 if [ "$mode" = "exact" ]; then
     setsid "{paths['apply_exact_refresh_script']}" "${{target_width}}" "${{target_height}}" "$sync_since" >/dev/null 2>&1 &
@@ -5025,6 +5043,7 @@ def display_snapshot() -> Dict[str, Any]:
     )
     current_headless_mode = _current_headless_mode(state, sunshine_active, sway_active)
     portal_handoff_active = PORTAL_ACTIVE_PATH.exists()
+    sunshine_client_hdr = _safe_string(active_launch_status.get("hdr"))
     audio_guard_state = "active" if sunshine_active and Path(state["paths"]["audio_module_file"]).exists() else "inactive"
     kwin_status = _kwin_input_isolation_status(state) if configured else _empty_kwin_input_isolation_status()
     sunshine_input_devices = _sunshine_virtual_input_devices() if configured else []
@@ -5087,6 +5106,7 @@ def display_snapshot() -> Dict[str, Any]:
         "sunshine_unit": _sunshine_unit(),
         "sunshine_active": sunshine_active,
         "sway_active": sway_active,
+        "sunshine_client_hdr": sunshine_client_hdr,
         "bridge_state": _bridge_service_state() if configured else "inactive",
         "audio_guard_state": audio_guard_state,
         "audio_sink": state["audio_sink"],

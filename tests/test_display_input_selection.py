@@ -928,6 +928,23 @@ H: Handlers=sysrq kbd event29
         self.assertIn("Requested frame rate", resolver_script)
         self.assertIn('print(f"{fps:.2f}")', resolver_script)
         self.assertIn('attempts=100', resolver_script)
+
+    def test_scripts_include_hdr_support(self) -> None:
+        state = manager._default_state()
+        scripts = manager._script_templates(state)
+
+        launch_script = scripts[Path(state["paths"]["launch_app_script"])]
+        set_resolution_script = scripts[Path(state["paths"]["set_resolution_script"])]
+        resolver_script = scripts[Path(state["paths"]["resolve_stream_fps_script"])]
+
+        self.assertIn('"SUNSHINE_CLIENT_HDR=${SUNSHINE_CLIENT_HDR:-0}"', launch_script)
+        self.assertIn('if [ "${SUNSHINE_CLIENT_HDR:-0}" = "1" ]; then', launch_script)
+        self.assertIn('"DXVK_HDR=1"', launch_script)
+        self.assertIn('"ENABLE_GAMESCOPE_WSI=1"', launch_script)
+
+        self.assertIn('target_hdr="${SUNSHINE_CLIENT_HDR:-0}"', set_resolution_script)
+        self.assertIn('if [ "$target_hdr" = "1" ]; then', set_resolution_script)
+        self.assertIn('hdr=${SUNSHINE_CLIENT_HDR:-0}', launch_script)
         self.assertIn('if [ "$fallback_mode" = "none" ]; then', resolver_script)
         self.assertIn('since_time="${3:-}"', resolver_script)
         self.assertIn('journalctl --user -u "', resolver_script)
