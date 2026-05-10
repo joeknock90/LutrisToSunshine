@@ -640,6 +640,7 @@ def _default_state() -> Dict[str, Any]:
         "sway_socket": DISPLAY_SOCKET_PATH,
         "udev_rule_path": UDEV_RULE_PATH,
         "sunshine_audio_sink": None,
+        "wlr_drm_devices": None,
         "exclusive_input_devices": _empty_exclusive_input_state(),
         "paths": paths,
     }
@@ -1247,6 +1248,56 @@ def _is_plasma_session() -> bool:
         or any(marker in session_desktop for marker in plasma_markers)
         or any(marker in desktop_session for marker in plasma_markers)
     )
+
+
+def _detect_gpus() -> Dict[str, Optional[Dict[str, str]]]:
+    gpus: Dict[str, Optional[Dict[str, str]]] = {"igpu": None, "dgpu": None}
+    for card_path in sorted(glob.glob("/sys/class/drm/card*")):
+        if not re.match(r".*/card\d+$", card_path):
+            continue
+
+        uevent_path = Path(card_path) / "device/uevent"
+        if not uevent_path.exists():
+            continue
+
+        uevent_data = {}
+        try:
+            for line in uevent_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    uevent_data[k] = v
+        except OSError:
+            continue
+
+        pci_id = uevent_data.get("PCI_ID")
+        if not pci_id:
+            continue
+
+        try:
+            vendor, device = pci_id.split(":")
+        except ValueError:
+            continue
+        vendor = f"0x{vendor.lower()}"
+        device = f"0x{device.lower()}"
+
+        slot = uevent_data.get("PCI_SLOT_NAME", "")
+        # Heuristic: bus 0000:00 is usually the integrated GPU root bus
+        is_integrated = slot.startswith("0000:00:")
+
+        gpu_info = {
+            "vendor": vendor,
+            "device": device,
+            "card": os.path.basename(card_path),
+        }
+
+        if is_integrated:
+            if not gpus["igpu"]:
+                gpus["igpu"] = gpu_info
+        else:
+            if not gpus["dgpu"]:
+                gpus["dgpu"] = gpu_info
+
+    return gpus
 
 
 def _host_session_name() -> str:
@@ -2961,6 +3012,10 @@ def _script_templates(state: Dict[str, Any]) -> Dict[Path, str]:
         launch_command+=("MANGOHUD_CONFIG=$mangohud_config_value")
     fi
 """
+    wlr_drm_devices_block = ""
+    if state.get("wlr_drm_devices"):
+        wlr_drm_devices_block = f'    WLR_DRM_DEVICES={shlex.quote(state["wlr_drm_devices"])} \\\n'
+
     return {
         Path(paths["sway_config"]): f"""# Managed by LutrisToSunshine display.
 output HEADLESS-1 resolution {FALLBACK_WIDTH}x{FALLBACK_HEIGHT}@{FALLBACK_FPS}Hz
@@ -3026,7 +3081,7 @@ unset KDE_SESSION_VERSION
     XDG_CURRENT_DESKTOP=sway \
     XDG_SESSION_DESKTOP=sway \
     SWAYSOCK="{state['sway_socket']}" \
-    WLR_BACKENDS=headless,libinput \
+{wlr_drm_devices_block}    WLR_BACKENDS=headless,libinput \
     LIBSEAT_BACKEND=noop \
     /usr/bin/sway --config "{paths['sway_config']}" &
 sway_pid=$!
@@ -4626,10 +4681,26 @@ def _udev_rule(isolation_mode: Optional[str] = None) -> str:
     if group_name:
         sunshine_input_permissions.append(f'GROUP="{group_name}"')
     sunshine_input_clause = ", ".join(sunshine_input_permissions)
-    return f"""# Managed by LutrisToSunshine display.
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{{id/vendor}}=="{SUNSHINE_INPUT_VENDOR_ID:04x}", ATTRS{{id/product}}=="{SUNSHINE_INPUT_PRODUCT_ID:04x}", {sunshine_input_clause}
-ACTION!="remove", KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uhid"
-"""
+
+    lines = [
+        "# Managed by LutrisToSunshine display.",
+        f'ACTION=="add|change", SUBSYSTEM=="input", ATTRS{{id/vendor}}=="{SUNSHINE_INPUT_VENDOR_ID:04x}", ATTRS{{id/product}}=="{SUNSHINE_INPUT_PRODUCT_ID:04x}", {sunshine_input_clause}',
+        'ACTION!="remove", KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uhid"',
+    ]
+
+    gpus = _detect_gpus()
+    if gpus["igpu"]:
+        igpu = gpus["igpu"]
+        lines.append(
+            f'SUBSYSTEM=="drm", ACTION=="add", ATTRS{{vendor}}=="{igpu["vendor"]}", ATTRS{{device}}=="{igpu["device"]}", SYMLINK+="dri/by-name/igpu"'
+        )
+    if gpus["dgpu"]:
+        dgpu = gpus["dgpu"]
+        lines.append(
+            f'SUBSYSTEM=="drm", ACTION=="add", ATTRS{{vendor}}=="{dgpu["vendor"]}", ATTRS{{device}}=="{dgpu["device"]}", SYMLINK+="dri/by-name/dgpu"'
+        )
+
+    return "\n".join(lines) + "\n"
 
 
 def _install_udev_rule(state: Dict[str, Any]) -> bool:
@@ -4929,6 +5000,33 @@ def setup_display() -> int:
         return 1
 
     state = load_state()
+
+    gpus = _detect_gpus()
+    if gpus["igpu"] and gpus["dgpu"]:
+        print("\nMultiple GPUs detected (integrated and discrete).")
+        print("1. Use dGPU as primary (recommended for performance)")
+        print("2. Use iGPU as primary (recommended for power saving / low latency)")
+        print("3. Default (use dGPU if available, then iGPU)")
+
+        choice = get_user_input(
+            "Select primary GPU preference [3]: ",
+            lambda val: val.strip() or "3",
+            "Enter 1, 2, or 3.",
+        )
+
+        if choice == "1":
+            state["wlr_drm_devices"] = "/dev/dri/by-name/dgpu"
+        elif choice == "2":
+            state["wlr_drm_devices"] = "/dev/dri/by-name/igpu"
+        else:
+            state["wlr_drm_devices"] = "/dev/dri/by-name/dgpu:/dev/dri/by-name/igpu"
+    elif gpus["igpu"]:
+        state["wlr_drm_devices"] = "/dev/dri/by-name/igpu"
+    elif gpus["dgpu"]:
+        state["wlr_drm_devices"] = "/dev/dri/by-name/dgpu"
+    else:
+        state["wlr_drm_devices"] = None
+
     sunshine_was_active = _sunshine_service_active()
     state = _remember_sunshine_execstart(state)
     state = refresh_managed_files(state)
