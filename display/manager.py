@@ -3578,7 +3578,7 @@ if run_audio_command pactl list short sinks | awk '{{print $2}}' | grep -Fx "$si
     exit 0
 fi
 
-module_id="$(run_audio_command pactl load-module module-null-sink sink_name="$sink_name" sink_properties=device.description='LutrisToSunshine Virtual Display')"
+module_id="$(run_audio_command pactl load-module module-null-sink sink_name="$sink_name" sink_properties=device.description='LutrisToSunshine Virtual Display' channels=6 channel_map=front-left,front-right,rear-left,rear-right,front-center,lfe)"
 printf '%s\\n' "$module_id" > "$module_file"
 """,
         Path(paths["audio_cleanup_script"]): f"""#!/bin/bash
