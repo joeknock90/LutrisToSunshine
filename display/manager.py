@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from utils.input import get_user_input
+from utils.input import get_user_input, get_yes_no_input
 from display import sunshine_service as _svc
 from display.utils import run_command, safe_string
 
@@ -173,6 +173,13 @@ def detect_sunshine_config_root() -> Path:
         if candidate.exists():
             return candidate
     return _config_root_candidates()[0]
+
+
+def _resolve_sunshine_config_root(unit_name: str) -> Path:
+    if unit_name and unit_name.startswith("app-"):
+        flatpak_id = unit_name.removeprefix("app-").removesuffix(".service")
+        return Path.home() / ".var" / "app" / flatpak_id / "config" / "sunshine"
+    return detect_sunshine_config_root()
 
 
 def _evdev_import_error() -> Optional[str]:
@@ -618,7 +625,7 @@ def _state_paths(unit_name: str) -> Dict[str, str]:
         "sunshine_override": str(override_dir / "override.conf"),
         "input_bridge_script": str(BIN_ROOT / "lutristosunshine-input-bridge.py"),
         "kwin_input_isolation_script": str(BIN_ROOT / "lutristosunshine-kwin-input-isolation.py"),
-        "sunshine_conf": str(detect_sunshine_config_root() / "sunshine.conf"),
+        "sunshine_conf": str(_resolve_sunshine_config_root(unit_name) / "sunshine.conf"),
         "kwin_input_isolation_status_file": str(PROFILE_ROOT / "kwin-input-isolation-status.json"),
     }
 
@@ -641,6 +648,7 @@ def _default_state() -> Dict[str, Any]:
         "gpu_mode": "auto",
         "gpu_card_path": "",
         "gpu_render_path": "",
+        "renderer_mode": "default",
     }
     state["paths"] = _state_paths(_svc.sunshine_unit())
     return state
@@ -670,6 +678,7 @@ def load_state() -> Dict[str, Any]:
     state["gpu_mode"] = safe_string(state.get("gpu_mode")).lower() if safe_string(state.get("gpu_mode")).lower() in {"auto", "manual"} else "auto"
     state["gpu_card_path"] = safe_string(state.get("gpu_card_path"))
     state["gpu_render_path"] = safe_string(state.get("gpu_render_path"))
+    state["renderer_mode"] = safe_string(state.get("renderer_mode")).lower() if safe_string(state.get("renderer_mode")).lower() in {"default", "vulkan"} else "default"
     state["paths"] = _state_paths(state["sunshine_unit_name"])
     return state
 
@@ -867,12 +876,12 @@ def configure_gpu() -> int:
     state = load_state()
     print("")
     print("Virtual display GPU selection")
-    print("This controls which GPU wlroots uses for the headless virtual display.")
+    print("Pick which graphics card drives the virtual display.")
     print("Most users should leave this on Auto.")
     current_label = gpu_status_label(state)
     print(f"Current: {current_label}")
     print("")
-    print("  0. Auto — wlroots chooses GPU automatically")
+    print("  0. Auto — let the system decide")
     gpus = _detect_available_gpus()
     if not gpus:
         print("")
@@ -901,12 +910,62 @@ def configure_gpu() -> int:
     )
     if choice == "0":
         set_gpu_mode("auto")
-        print("GPU selection set to Auto. wlroots will choose the GPU.")
+        print("GPU selection set to Auto.")
     else:
         idx = int(choice) - 1
         gpu = gpus[idx]
         set_gpu_mode("manual", gpu["card_path"], gpu["render_path"])
         print(f"GPU selection set to {gpu['label']} ({gpu['card_path']}).")
+
+    print("")
+    if get_yes_no_input("Restart the virtual display for the change to take effect?", default=True):
+        return restart_display()
+    return 0
+
+
+def renderer_status_label(state: Dict[str, Any]) -> str:
+    mode = safe_string(state.get("renderer_mode")).lower()
+    if mode == "vulkan":
+        return "[VULKAN] HDR capable, may have less GPU support"
+    return "[DEFAULT] GLES2 — stable, broad GPU support, no HDR"
+
+
+def set_renderer_mode(mode: str) -> Dict[str, Any]:
+    state = load_state()
+    if mode not in ("default", "vulkan"):
+        mode = "default"
+    state["renderer_mode"] = mode
+    return refresh_managed_files(state)
+
+
+def configure_renderer_mode() -> int:
+    state = load_state()
+    print("")
+    print("Virtual display renderer")
+    print("Controls how graphics are drawn on the virtual display.")
+    print("GLES2: works on most GPUs, no HDR.")
+    print("Vulkan: HDR capable, may not work on all GPUs.")
+    current = safe_string(state.get("renderer_mode")).lower()
+    print(f"Current: {'[VULKAN] HDR capable, may have less GPU support' if current == 'vulkan' else '[DEFAULT] GLES2 — stable, broad GPU support, no HDR'}")
+    print("")
+    print("  0. GLES2 — stable, broad GPU support (no HDR)")
+    print("  1. Vulkan — HDR pass-through (may have less GPU support)")
+    print("")
+    choice = get_user_input(
+        "Choose renderer mode: ",
+        lambda value: value.strip() if value.strip() in {"0", "1"} else (_ for _ in ()).throw(ValueError()),
+        "Enter 0 for GLES2 or 1 for Vulkan.",
+    )
+    if choice == "0":
+        set_renderer_mode("default")
+        print("Renderer set to GLES2. Stable and broad GPU support, no HDR.")
+    else:
+        set_renderer_mode("vulkan")
+        print("Renderer set to Vulkan. HDR pass-through enabled (may have less GPU support).")
+
+    print("")
+    if get_yes_no_input("Restart the virtual display for the change to take effect?", default=True):
+        return restart_display()
     return 0
 
 
@@ -3113,7 +3172,21 @@ def _script_templates(state: Dict[str, Any]) -> Dict[Path, str]:
 """.replace("{resolve_stream_fps_script}", paths["resolve_stream_fps_script"]).replace("{refresh_rate_sync_mode}", refresh_rate_sync_mode)
         mangohud_env_append_block = """
     if [ -n "$mangohud_config_value" ]; then
-        launch_command+=("MANGOHUD_CONFIG=$mangohud_config_value")
+        if is_flatpak_command "$command_to_run"; then
+            command_to_run="$(python3 - "$command_to_run" "$mangohud_config_value" <<'PY'
+import shlex, sys
+tokens = shlex.split(sys.argv[1])
+env_val = sys.argv[2]
+idx = 0
+if len(tokens) >= 2 and tokens[:2] == ["flatpak-spawn", "--host"]:
+    idx = 2
+tokens.insert(idx + 2, f"--env=MANGOHUD_CONFIG={env_val}")
+print(shlex.join(tokens))
+PY
+)"
+        else
+            launch_command+=("MANGOHUD_CONFIG=$mangohud_config_value")
+        fi
     fi
 """
     gpu_card_path = safe_string(state.get("gpu_card_path"))
@@ -3147,6 +3220,13 @@ fi
             "WLR_RENDER_DRM_DEVICE=$wlr_render_drm_device_value"
         )
     fi
+"""
+    renderer_env_vars_block = ""
+    if state.get("renderer_mode") == "vulkan":
+        renderer_env_vars_block = """
+    sway_cmd+=(
+        "WLR_RENDERER=vulkan"
+    )
 """
     return {
         Path(paths["sway_config"]): f"""# Managed by LutrisToSunshine display.
@@ -3219,7 +3299,7 @@ unset KDE_SESSION_VERSION
         "WLR_BACKENDS=headless,libinput"
         "LIBSEAT_BACKEND=noop"
     )
-{gpu_env_vars_block}
+{gpu_env_vars_block}{renderer_env_vars_block}
     sway_cmd+=(/usr/bin/sway --config "{paths['sway_config']}")
     "${{sway_cmd[@]}}" &
 sway_pid=$!
@@ -3718,6 +3798,16 @@ if [ -z "$encoded_command" ]; then
     exit 1
 fi
 
+if [ -f /.flatpak-info ]; then
+    sunshine_env=()
+    for var in SUNSHINE_CLIENT_FPS SUNSHINE_CLIENT_WIDTH SUNSHINE_CLIENT_HEIGHT SUNSHINE_CLIENT_HMAX SUNSHINE_CLIENT_VMAX; do
+        if [ -n "${{!var:-}}" ]; then
+            sunshine_env+=("--env=$var=${{!var}}")
+        fi
+    done
+    exec flatpak-spawn --host "${{sunshine_env[@]}}" "{paths['headless_prep_script']}" "$@"
+fi
+
 if [ ! -S "{state['sway_socket']}" ]; then
     echo "Headless sway IPC socket is not ready." >&2
     exit 1
@@ -3985,7 +4075,13 @@ if [ -z "$encoded_command" ]; then
 fi
 
 if [ -f /.flatpak-info ]; then
-    exec flatpak-spawn --host "{paths['launch_app_script']}" "$@"
+    sunshine_env=()
+    for var in SUNSHINE_CLIENT_FPS SUNSHINE_CLIENT_WIDTH SUNSHINE_CLIENT_HEIGHT SUNSHINE_CLIENT_HMAX SUNSHINE_CLIENT_VMAX; do
+        if [ -n "${{!var:-}}" ]; then
+            sunshine_env+=("--env=$var=${{!var}}")
+        fi
+    done
+    exec flatpak-spawn --host "${{sunshine_env[@]}}" "{paths['launch_app_script']}" "$@"
 fi
 
 if [ ! -S "{state['sway_socket']}" ]; then
@@ -4683,6 +4779,16 @@ echo $discrete_gpu-$internal_gpu
         Path(paths["resolve_stream_fps_script"]): f"""#!/bin/bash
 set -euo pipefail
 
+if [ -f /.flatpak-info ]; then
+    sunshine_env=()
+    for var in SUNSHINE_CLIENT_FPS SUNSHINE_CLIENT_WIDTH SUNSHINE_CLIENT_HEIGHT SUNSHINE_CLIENT_HMAX SUNSHINE_CLIENT_VMAX; do
+        if [ -n "${{!var:-}}" ]; then
+            sunshine_env+=("--env=$var=${{!var}}")
+        fi
+    done
+    exec flatpak-spawn --host "${{sunshine_env[@]}}" "{paths['resolve_stream_fps_script']}" "$@"
+fi
+
 requested_fps="${{SUNSHINE_CLIENT_FPS:-}}"
 mode_override="${{1:-}}"
 fallback_mode="${{2:-fallback}}"
@@ -4803,6 +4909,16 @@ set -euo pipefail
 
 if [ "${{#}}" -lt 2 ]; then
     exit 0
+fi
+
+if [ -f /.flatpak-info ]; then
+    sunshine_env=()
+    for var in SUNSHINE_CLIENT_FPS SUNSHINE_CLIENT_WIDTH SUNSHINE_CLIENT_HEIGHT SUNSHINE_CLIENT_HMAX SUNSHINE_CLIENT_VMAX; do
+        if [ -n "${{!var:-}}" ]; then
+            sunshine_env+=("--env=$var=${{!var}}")
+        fi
+    done
+    exec flatpak-spawn --host "${{sunshine_env[@]}}" "{paths['apply_exact_refresh_script']}" "$@"
 fi
 
 width="${{1}}"
@@ -5136,36 +5252,36 @@ def configure_exclusive_input_devices() -> int:
 
     if not devices:
         if selections:
-            print("No eligible host controllers are currently connected.")
-            print("Saved exclusive controllers:")
+            print("No gamepads detected.")
+            print("Saved gamepads:")
             for selection in selections:
                 print(f"- {selection['label']}")
             get_user_input(
-                "Enter 0 to clear saved controller selections, or press Ctrl+C to cancel: ",
+                "Enter 0 to clear saved gamepads, or Ctrl+C to cancel: ",
                 lambda raw: raw.strip() if raw.strip() == "0" else (_ for _ in ()).throw(ValueError()),
-                "Invalid selection. Enter 0 to clear the saved controller selections.",
+                "Enter 0 to clear.",
             )
             state["exclusive_input_devices"] = _empty_exclusive_input_state()
             save_state(state)
             _apply_input_bridge_runtime_state(state)
-            print("Exclusive host controller routing cleared.")
+            print("Gamepad routing cleared.")
             return 0
 
-        print("No eligible host controllers are currently connected.")
+        print("No gamepads detected.")
         return 0
 
-    print("Connected host controllers:")
+    print("Connected gamepads:")
     for index, device in enumerate(devices, start=1):
         selected = " [selected]" if _device_matches_any_selection(device, selections) else ""
         print(f"{index}. {device['label']}{selected}")
 
     toggled_indices = get_user_input(
-        "Toggle controller numbers for exclusive routing (comma-separated or ranges), press Enter to keep, or 0 to clear: ",
+        "Toggle numbers to route them to the stream (e.g. 1,3-4), Enter to keep, or 0 to clear: ",
         lambda raw: _parse_selection_toggle_numbers(raw, len(devices)),
-        "Invalid selection. Please use comma-separated numbers or ranges such as 1,3-4.",
+        "Invalid selection. Use comma-separated numbers or ranges such as 1,3-4.",
     )
     if toggled_indices is None:
-        print("Exclusive host controller routing unchanged.")
+        print("Gamepad routing unchanged.")
         return 0
 
     state["exclusive_input_devices"] = {
@@ -5176,9 +5292,9 @@ def configure_exclusive_input_devices() -> int:
 
     selected_devices = state["exclusive_input_devices"]["devices"]
     if selected_devices:
-        print(f"Saved {len(selected_devices)} exclusive host controller(s).")
+        print(f"Routed {len(selected_devices)} gamepad(s) to the stream.")
     else:
-        print("Exclusive host controller routing cleared.")
+        print("Gamepad routing cleared.")
     return 0
 
 
@@ -5394,6 +5510,8 @@ def display_snapshot() -> Dict[str, Any]:
         "gpu_card_path": safe_string(state.get("gpu_card_path")),
         "gpu_render_path": safe_string(state.get("gpu_render_path")),
         "gpu_status_label": gpu_status_label(state),
+        "renderer_mode": safe_string(state.get("renderer_mode")).lower() if safe_string(state.get("renderer_mode")).lower() in {"default", "vulkan"} else "default",
+        "renderer_status_label": renderer_status_label(state),
         "next_step": "",
     }
     if not configured:
@@ -5652,6 +5770,7 @@ def display_status() -> int:
         print("- No host controllers are currently reserved for passthrough.")
     print(f"Logs: {snapshot['last_launch_log_file']}")
     print(f"Virtual display GPU: {snapshot['gpu_status_label']}")
+    print(f"Display renderer: {snapshot['renderer_status_label']}")
     print(f"Next step: {snapshot['next_step']}")
     return 0
 
